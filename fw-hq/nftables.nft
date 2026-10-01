@@ -1,0 +1,54 @@
+#!/usr/sbin/nft -f
+# HQ edge firewall. Interfaces: wan (internet), lan (HQ users), dmz (public web).
+flush ruleset
+
+define HQ_LAN    = 10.10.1.0/24
+define DMZ       = 10.10.3.0/24
+define BRANCH    = 10.10.2.0/24
+define BRANCH_FW = 203.0.113.20
+define WEB       = 10.10.3.10
+
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif "lo" accept
+    icmp type echo-request limit rate 5/second accept
+    ip saddr $BRANCH_FW udp dport { 500, 4500 } accept comment "IKE from branch firewall"
+    ip saddr $BRANCH_FW meta l4proto esp accept comment "ESP from branch firewall"
+    iifname "lan" tcp dport 22 accept comment "SSH management from HQ LAN only"
+    log prefix "FW-IN-DROP " group 1
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+
+    # Site-to-site VPN. Branch traffic is only accepted if it was decrypted
+    # from the IPsec tunnel (secpath), never if it arrives in clear text.
+    iifname "lan" ip daddr $BRANCH accept comment "HQ -> branch via VPN"
+    iifname "wan" ip saddr $BRANCH ip daddr $HQ_LAN meta secpath exists accept comment "branch -> HQ via VPN"
+
+    iifname "lan" oifname "wan" tcp dport { 80, 443 } accept comment "HQ users browse the internet"
+    iifname "lan" oifname "wan" udp dport 53 accept comment "DNS"
+    iifname "lan" oifname "wan" icmp type echo-request accept
+    iifname "lan" oifname "dmz" tcp dport { 22, 80 } accept comment "HQ admins manage the DMZ"
+    iifname "wan" oifname "dmz" ip daddr $WEB tcp dport 80 ct status dnat accept comment "port forward to public web"
+
+    log prefix "FW-FWD-DROP " group 1
+  }
+}
+
+table ip nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat;
+    iifname "wan" tcp dport 80 dnat to $WEB:80 comment "port forward: public web"
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat;
+    oifname "wan" ip saddr $HQ_LAN ip daddr $BRANCH accept comment "NAT exemption: VPN traffic keeps its real source"
+    oifname "wan" ip saddr { $HQ_LAN, $DMZ } masquerade comment "outbound internet NAT"
+  }
+}

@@ -1,0 +1,38 @@
+#!/usr/sbin/nft -f
+# Branch office firewall. Interfaces: wan (internet), lan (branch).
+flush ruleset
+
+define BRANCH_LAN = 10.10.2.0/24
+define HQ_LAN     = 10.10.1.0/24
+define HQ_FW      = 203.0.113.10
+
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif "lo" accept
+    icmp type echo-request limit rate 5/second accept
+    ip saddr $HQ_FW udp dport { 500, 4500 } accept comment "IKE from HQ firewall"
+    ip saddr $HQ_FW meta l4proto esp accept comment "ESP from HQ firewall"
+    log prefix "FW-IN-DROP " group 1
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iifname "lan" ip daddr $HQ_LAN accept comment "branch -> HQ via VPN"
+    iifname "wan" ip saddr $HQ_LAN ip daddr $BRANCH_LAN meta secpath exists accept comment "HQ -> branch via VPN"
+    iifname "lan" oifname "wan" tcp dport { 80, 443 } accept comment "branch users browse the internet"
+    log prefix "FW-FWD-DROP " group 1
+  }
+}
+
+table ip nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat;
+    oifname "wan" ip saddr $BRANCH_LAN ip daddr $HQ_LAN accept comment "NAT exemption: VPN traffic"
+    oifname "wan" ip saddr $BRANCH_LAN masquerade comment "outbound internet NAT"
+  }
+}
